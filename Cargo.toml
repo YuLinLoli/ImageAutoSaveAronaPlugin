@@ -1,0 +1,46 @@
+[package]
+# 插件发布名。真正的插件 id 是 src/lib.rs 里 PluginMeta::new 的第一个参数
+# （"image-auto-save"），它决定 plugins/<id>/、config/<id>/arona.yml 与 data/<id>/ 的目录名。
+name = "image-auto-save-arona-plugin"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "好友图片自动保存：按白名单收下好友私聊发来的图片落盘，并把图片连发送人一起预览给指定目标"
+
+# 本包是独立仓库的根，不被任何 workspace 收养
+[workspace]
+
+[lib]
+# 产物 target/release/image_auto_save_plugin.dll，拷进 <运行目录>/plugins/image-auto-save/
+name = "image_auto_save_plugin"
+path = "src/lib.rs"
+# cdylib 供框架启动时扫描装载；rlib 那份只给 `cargo test` 用，宿主永远不链接本 crate
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# 框架仓与本插件仓同在 G:\rustprojects 下，相对路径跟着仓库一起挪。
+# 发版时换成 git 标签或 crates.io（框架仓库 PLUGIN_DEVELOPMENT.md §15）：
+#   arona = { package = "arona-rs", git = "https://github.com/YuLinLoli/Arona-rs", tag = "v1.1.0", default-features = false }
+# default-features = false 是硬要求（§16）：gui 由宿主决定，插件带上会把 eframe/wgpu 整条链拖进 dll。
+arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", version = "1.1.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+# get_image 动作的入参与返回：框架不 re-export serde_json，要自己带（§15）
+serde_json = "1"
+# 文件名里的时间戳与 {date} 子目录
+chrono = "0.4"
+# 少数实现端把本机路径写成 file:/// 且对中文做了百分号编码
+percent-encoding = "2"
+# 只用于解 get_image 返回的 base64；出站 HTTP 一律走 arona::runtime::http，本 crate 不链接 reqwest
+base64 = "0.22"
+
+[dev-dependencies]
+# 用例里手工拼一份 YAML，验证"用户只写了一项也能读出来"
+serde_yaml = "0.9"
+# save_images 那三条用例要跑 async：§18 规定异步用例统一 current_thread
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[profile.release]
+# 与框架同一档；握手比的是 profile 名而不是调优参数
+opt-level = 2
+# 要在 IDE 里 attach 到 arona-rs.exe 给插件打断点，放开下一行再重编 dll
+# debug = 1

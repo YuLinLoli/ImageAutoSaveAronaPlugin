@@ -1,0 +1,8 @@
+# 宿主与插件的 ABI 指纹里带着 rustc 的 release 号，编译器版本不一致的插件会被宿主直接拒载。
+# 本行必须与框架仓库 rust-toolchain.toml 逐字一致；框架升级工具链时插件要跟着改再重编。
+#
+# 这里故意不写 components：写了每次 cargo 都会先补装组件，补装失败会整条命令回滚，
+# 还可能把工具链留在半装状态（rls 里 rlib 为空却谎报已装）。要 rustfmt/clippy 请显式跑：
+#   rustup component add rustfmt clippy
+[toolchain]
+channel = "1.98.0"

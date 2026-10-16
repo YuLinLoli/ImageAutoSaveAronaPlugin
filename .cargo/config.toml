@@ -1,0 +1,8 @@
+# 静态链接 MSVC 运行库：dll 不再依赖 VCRUNTIME/UCRT。
+# 必须与框架仓库根目录 .cargo/config.toml 逐字一致，否则插件与宿主各带一份 C 运行库，
+# 跨模块分配/释放内存会当场炸，框架握手也会在这里直接拒载。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

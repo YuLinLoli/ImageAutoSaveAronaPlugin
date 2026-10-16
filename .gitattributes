@@ -1,0 +1,20 @@
+# 与框架仓库同一份口径：入库 LF、签出也 LF，二进制不许被"修复"行尾。
+# 不写这条的话 Windows 上 core.autocrlf 会把 rustfmt 产物改成 CRLF，
+# 两个仓库同一个插件源码就出现两种行尾，diff 全是空白噪声。
+* text=auto eol=lf
+
+*.dll binary
+*.exe binary
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary
+*.ttf binary
+*.otf binary
+*.sqlite binary
+*.db binary
+
+*.yml text eol=lf
+*.toml text eol=lf
+*.rs text eol=lf
+*.md text eol=lf
