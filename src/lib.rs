@@ -291,7 +291,7 @@ mod tests {
     fn release_note_layout_matches_the_built_abi() {
         assert_eq!(
             arona::plugin::abi::ABI_LAYOUT,
-            9,
+            10,
             "框架抬了布局号，README 那一行与本用例都要跟着改"
         );
     }
