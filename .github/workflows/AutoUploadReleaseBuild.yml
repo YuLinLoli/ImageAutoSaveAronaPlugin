@@ -1,0 +1,176 @@
+# 插件自动发布：推 v* 标签时构建 Windows 版 dll 并建 Release。与框架仓同名工作流一套路。
+#
+# 插件与框架唯一不同的一处，也是这份文件存在的核心理由：Cargo.toml 里
+# `arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", ... }` 是**路径依赖**，
+# CI 上那个上一级目录本来不存在。两种省事的做法都不成立——
+#   · 换成 crates.io 版本：那是按发布快照编的，与宿主实际用的框架源码不是一个东西；
+#   · 换成 git 标签：标签落后于宿主构建所用的提交时，编出的 dll 布局号对不上，装载当场被拒。
+# 所以这里把框架仓签出来放在插件的同级，路径依赖原样成立，目录形状和本机开发一模一样
+# （G:\rustprojects 下插件与 Arona-rs 并排）。宿主用哪份框架编的，就把那个 ref 填进
+# 仓库 Settings → Actions → Variables 的 `ARONA_REF`（分支名、标签或提交号都行）；
+# 不设就用 main——它与当前发版宿主同源（`PluginMeta.group_scoped` 与布局 10 都在上面）。
+#
+# 版本号以 Cargo.toml 为准：标签 v0.1.2 必须等于 [package] version，否则直接失败——
+# 插件上报给框架的版本取自 env!("CARGO_PKG_VERSION")，标签与它不一致就会出现
+# "Release 写着 0.1.2、GUI 里显示 0.1.1" 这种没法核对的事。
+name: AutoUploadReleaseBuild
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  Build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - name: Checkout 插件
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      # 路径依赖的上一级：框架仓签到插件的同级目录，../Arona-rs/crates/arona 才解析得动
+      - name: Checkout 框架（供路径依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: YuLinLoli/Arona-rs
+          ref: ${{ vars.ARONA_REF || 'main' }}
+          path: Arona-rs
+
+      # 工具链由插件仓自己的 rust-toolchain.toml 唯一决定：ABI 指纹里带着 rustc 的 release 号，
+      # CI 用当天的 stable 编，产物就会和正式宿主对不上指纹而被拒载。这里只打印生效的那份。
+      - name: Show active toolchain
+        run: |
+          rustup show active-toolchain
+          rustc -vV
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugin
+
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $pkg = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+              Select-Object -First 1
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          if ($tag -ne $pkg.version) {
+              Write-Error "标签 ${{ github.ref_name }} 与 $($pkg.name) 版本 $($pkg.version) 不一致"
+              exit 1
+          }
+          Write-Host "版本校验通过: $($pkg.name) $($pkg.version)"
+
+      # 离线单测。各仓联网冒烟用例都带 #[ignore]，不会在这里跑
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      # 产物与发布说明一起准备好。发布说明里那三件事（宿主版本 / 工具链 / 投放路径）全部现取
+      # 现算，不从 README 手抄——手抄的那几处正是会跟代码各说各话的地方。
+      - name: Collect artifact and release notes
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $pkg = $meta.packages | Select-Object -First 1
+          $cdylib = $pkg.targets | Where-Object { $_.kind -contains 'cdylib' } |
+              Select-Object -First 1
+          if (-not $cdylib) {
+              Write-Error "crate 里没有 cdylib 目标，编不出能被框架扫描装载的 dll"
+              exit 1
+          }
+          $dll = Join-Path "target/release" "$($cdylib.name).dll"
+          if (-not (Test-Path $dll)) { Write-Error "未找到构建产物 $dll"; exit 1 }
+          $size = (Get-Item $dll).Length
+          if ($size -lt 100KB) {
+              Write-Error "dll 只有 $size 字节，链接明显没成功，不发出去坑用户"
+              exit 1
+          }
+
+          # 框架那一侧的三项：crate 版本、符号布局号、插件契约版本。都从签下来的源码里读，
+          # 因为"宿主是用哪份框架编的"决定这份 dll 装不装得进去
+          $fwManifest = "../Arona-rs/crates/arona/Cargo.toml"
+          $fwVersion = ([regex]::Match((Get-Content -Raw $fwManifest),
+              '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
+          $abiText = Get-Content -Raw "../Arona-rs/crates/arona/src/plugin/abi.rs"
+          $layout = ([regex]::Match($abiText,
+              'ABI_LAYOUT:\s*u32\s*=\s*(\d+)')).Groups[1].Value
+          $descText = Get-Content -Raw "../Arona-rs/crates/arona/src/plugin/description.rs"
+          $contract = ([regex]::Match($descText,
+              'FRAMEWORK_API_VERSION[^=]*=\s*ApiVersion::new\((\d+),\s*(\d+),\s*(\d+)\)'))
+          $contractText = "{0}.{1}.{2}" -f $contract.Groups[1].Value, $contract.Groups[2].Value,
+              $contract.Groups[3].Value
+
+          # 插件 id 从 meta() 那一行取；取不到就退回 README 的投放说明，不硬编一个假 id
+          $lib = Get-Content -Raw $cdylib.src_path
+          $id = ([regex]::Match($lib, 'PluginMeta::new\(\s*"([^"]+)"')).Groups[1].Value
+          if (-not $id) {
+              $id = ([regex]::Match($lib, 'PLUGIN_ID[^=]*=\s*"([^"]+)"')).Groups[1].Value
+          }
+          if (-not $id) { $id = '<插件 id，见 plugin.yml>' }
+
+          # 工具链三件套：ABI 指纹的后两段就是这两行，出事先在日志里跟插件上报的逐段对
+          $vv = rustc -vV | Out-String
+          $rustc = ([regex]::Match($vv, '(?m)^release:\s*(.+)$')).Groups[1].Value.Trim()
+          # 变量千万别叫 $host：那是 PowerShell 的只读自动变量（宿主对象本身），
+          # 赋值会当场报 VariableNotWritable，写出来的三元组变成 InternalHost
+          $hostTriple = ([regex]::Match($vv, '(?m)^host:\s*(.+)$')).Groups[1].Value.Trim()
+
+          $asset = "$($cdylib.name)-$($pkg.version).dll"
+          Copy-Item $dll $asset -Force
+          $notes = @(
+              "适用于 Arona-rs $fwVersion（框架契约 $contractText，符号布局 $layout）",
+              "构建工具链：rustc $rustc，$hostTriple，--release，crt-static",
+              "下载后放进 <框架运行目录>/plugins/$id/，重启框架",
+              "",
+              "宿主必须是同一符号布局号才装得进去；对不上时框架会拒载并在日志写明两边各是几。",
+              "产物 $asset，$([math]::Round($size / 1MB, 2)) MB。"
+          )
+          # 显式无 BOM 的 UTF-8：Set-Content 的 -Encoding utf8 在 5.1 与 7 上行为不同
+          # （前者带 BOM），Release 正文开头多一个不可见字符很难查；WriteAllLines 两版一致，
+          # 而且是整份覆盖，不会把上一次跑剩的内容接在后面
+          [System.IO.File]::WriteAllLines(
+              (Join-Path (Get-Location) "NOTES.md"), $notes, (New-Object System.Text.UTF8Encoding($false)))
+          Get-Content NOTES.md
+          "ASSET_NAME=$asset" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: |
+            plugin/${{ env.ASSET_NAME }}
+            plugin/NOTES.md
+          if-no-files-found: error
+
+  Publish:
+    needs: Build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish Release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "dist/*.dll"
+          bodyPath: "dist/NOTES.md"
+          prerelease: ${{ contains(github.ref, 'pre') }}
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
