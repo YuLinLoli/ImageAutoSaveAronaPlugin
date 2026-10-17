@@ -170,7 +170,10 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           artifacts: "dist/*.dll"
-          bodyPath: "dist/NOTES.md"
+          # 入参名是 bodyFile，写成 bodyPath 不会失败——action 只给一条
+          # "Unexpected input(s)" 警告，Release 照建，正文静默为空。第一次跑就踩中了，
+          # 改名并留这一句：正文空着比构建失败更难发现
+          bodyFile: "dist/NOTES.md"
           prerelease: ${{ contains(github.ref, 'pre') }}
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}
