@@ -111,11 +111,27 @@ jobs:
           $contractText = "{0}.{1}.{2}" -f $contract.Groups[1].Value, $contract.Groups[2].Value,
               $contract.Groups[3].Value
 
-          # 插件 id 从 meta() 那一行取；取不到就退回 README 的投放说明，不硬编一个假 id
-          $lib = Get-Content -Raw $cdylib.src_path
-          $id = ([regex]::Match($lib, 'PluginMeta::new\(\s*"([^"]+)"')).Groups[1].Value
-          if (-not $id) {
-              $id = ([regex]::Match($lib, 'PLUGIN_ID[^=]*=\s*"([^"]+)"')).Groups[1].Value
+          # 插件 id：先扫 cdylib 的入口文件，再扫其余源文件（petpet 那种 lib.rs 只做 mod 转发、
+          # meta() 写在业务模块里的仓库要往后找）。两条判据都要求"像个 id"——小写字母开头、
+          # 只含小写字母/数字/-/_，且回退那条不许跨过分号。不这么钉就会抓错：BlueArchive 的
+          # meta() 第一个参数是常量、展示名又带大写，注释里提一句 PLUGIN_ID 就能让宽松的
+          # [^=]* 一路滑到下一个常量上，抓出「每日活动推送」这种中文展示名。
+          $entry = $cdylib.src_path
+          $files = @($entry) + (Get-ChildItem -Recurse -Filter *.rs -Path src |
+              ForEach-Object { $_.FullName } | Where-Object { $_ -ne $entry })
+          $id = ''
+          foreach ($file in $files) {
+              $text = Get-Content -Raw $file
+              $found = [regex]::Match($text,
+                  'PluginMeta::new\(\s*"(?<id>[a-z0-9][a-z0-9_-]{1,31})"')
+              if (-not $found.Success) {
+                  $found = [regex]::Match($text,
+                      '(?:const|static)[^;]*?PLUGIN_ID\s*:\s*&str\s*=\s*"(?<id>[a-z0-9][a-z0-9_-]{1,31})"')
+              }
+              if ($found.Success) {
+                  $id = $found.Groups['id'].Value
+                  break
+              }
           }
           if (-not $id) { $id = '<插件 id，见 plugin.yml>' }
 
