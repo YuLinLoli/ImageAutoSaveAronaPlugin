@@ -4,6 +4,9 @@
 //! 框架启动时扫描、握手、装载。配置只有四项，全在 GUI「插件管理 → 详情 → 配置」那一页：
 //! 是否开启、接收图片的好友列表、是否启用发送给好友预览、发送给好友列表。
 //!
+//! 每条处理完都**引用回复发图的人**：存成了回「图片已保存」，有没存成的再补一句
+//! 「图片保存失败」（一张都没存成时只回失败，绝不回成功的假话）。文案固定、不占配置项。
+//!
 //! 这是一个纯私聊插件：钩子只订 `BodyFilter::private("friend")`，群消息与群里的临时会话
 //! 都不进这一档，也一条命令都不接。所以 `meta()` 里声明了 `with_group_scoped(false)`：
 //! 框架据此收起「启用的群」那一格，`group_settings.<群>.disabled_plugins` 里就算残留着
@@ -38,6 +41,12 @@ use crate::config::{ImageAutoSaveConfig, SECTION};
 /// 插件 id：磁盘上的身份，`plugins/<id>/`、`config/<id>/arona.yml`、`data/<id>/` 全用它，
 /// 与 `meta().id`、配置区键名共用这一个来源。定了就别改——改名等于换一份用户数据。
 const PLUGIN_ID: &str = "image-auto-save";
+
+/// 存成之后引用回复发送者那一句
+const SAVED_NOTE: &str = "图片已保存";
+
+/// 有图没存成时引用回复发送者那一句
+const FAILED_NOTE: &str = "图片保存失败";
 
 /// 本插件不带任何跨调用状态：名单与开关每轮从配置区现读，所以是单位结构体
 #[derive(Default)]
@@ -90,11 +99,14 @@ impl AronaPlugin for ImageAutoSavePlugin {
                     let name = event.sender_name().unwrap_or("好友").to_string();
                     let api = event.api();
                     let dir = setup.image_dir();
+                    // 引用回复要挂的那条消息号；实现端没给就是 None，回执照样发、只是不引用
+                    let quoted = event.message_id();
+                    let total = images.len();
                     // 时间戳在投递任务之前定一次：一条消息里的几张图共用同一个前缀
                     let when = Local::now();
                     setup.spawn_as("保存图片", async move {
                         let saved = save_all(&api, &dir, &when, user_id, &name, &images).await;
-                        preview(&config, user_id, &name, &saved).await;
+                        announce(&config, quoted, user_id, &name, &saved, total).await;
                     });
                     HookFlow::Pass
                 }
@@ -159,14 +171,43 @@ async fn save_all(
     saved
 }
 
-/// 预览走框架统一发送口（`send_message`），所以出站钩子与黑名单都在这条路上；
+/// 该引用回复发送者哪几句：存成才报成功，有失败就报失败。
+/// 一张都没存成时绝不能回「图片已保存」——那种假回执比不回更糟
+fn notes(saved: usize, total: usize) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    if saved > 0 {
+        out.push(SAVED_NOTE);
+    }
+    if saved < total {
+        out.push(FAILED_NOTE);
+    }
+    out
+}
+
+/// 回执与预览都走框架统一发送口（`send_message`），所以出站钩子与黑名单都在这条路上；
 /// 没用 `api.send_private_msg` 那条协议层旁路（§9.1）。
-async fn preview(config: &ImageAutoSaveConfig, user_id: i64, name: &str, saved: &[MessageSegment]) {
+async fn announce(
+    config: &ImageAutoSaveConfig,
+    quoted: Option<i64>,
+    user_id: i64,
+    name: &str,
+    saved: &[MessageSegment],
+    total: usize,
+) {
+    // 引用回复原那条图片消息：mirai 的 QuoteReply 同一档（§19 的 Reply 段）。
+    // 实现端没给消息号时退成不引用的回话，别为了挂引用就把回执整条丢掉。
+    for text in notes(saved.len(), total) {
+        let message = match quoted {
+            Some(id) => OutgoingMessage::quoted(id, text),
+            None => OutgoingMessage::text(text),
+        };
+        let _ = send_message(MessageTarget::Private(user_id), message).await;
+    }
     if !config.preview_enabled || saved.is_empty() {
         return;
     }
     for segment in saved {
-        // 一条消息：原样的图片段 + 一行「发送人：好友名(QQ号)」。
+        // 一条预览：原样的图片段 + 一行「发送人：好友名(QQ号)」。
         // 图片段带着实现端给的线索回发，有直链时不必把字节再上传一遍（§19）。
         let message = OutgoingMessage::new(vec![
             segment.clone(),
@@ -286,14 +327,49 @@ mod tests {
     }
 
     /// README「发布三件事」里手抄的符号布局号必须等于编译进这份 dll 的那个常量。
-    /// 数字漂了的后果是用户拿旧宿主装新 dll（或反过来），而拒载日志只会说"布局不匹配"
+    /// 数字漂了的后果是用户拿旧宿主装新 dll（或反过来），而拒载日志只会说"布局不匹配"。
+    /// 光钉常量还不够——那一行是手抄的，所以把 README 里每处「布局 <数字>」都扫一遍。
     #[test]
     fn release_note_layout_matches_the_built_abi() {
         assert_eq!(
             arona::plugin::abi::ABI_LAYOUT,
             10,
-            "框架抬了布局号，README 那一行与本用例都要跟着改"
+            "框架抬了布局号，README 与本用例都要跟着改"
         );
+        let readme = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("发布说明就在仓库根，读不到是路径错了");
+        let mut claimed: Vec<u32> = Vec::new();
+        for (at, _) in readme.match_indices("布局") {
+            let digits: String = readme[at + "布局".len()..]
+                .trim_start()
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if !digits.is_empty() {
+                claimed.push(digits.parse().expect("全数字串总能解析"));
+            }
+        }
+        assert!(
+            !claimed.is_empty(),
+            "README 里一处「布局 <数字>」都没有，这条判据就空转了"
+        );
+        assert!(
+            claimed
+                .iter()
+                .all(|value| *value == arona::plugin::abi::ABI_LAYOUT),
+            "README 写过的布局号 {:?} 与当前 {} 不一致",
+            claimed,
+            arona::plugin::abi::ABI_LAYOUT,
+        );
+    }
+
+    /// 回执的判据：成与败各回一句都要发，但一张都没存成时绝不能回「图片已保存」
+    #[test]
+    fn receipt_never_fakes_a_success() {
+        assert_eq!(notes(2, 2), vec![SAVED_NOTE]);
+        assert_eq!(notes(0, 1), vec![FAILED_NOTE], "全失败只回失败");
+        assert_eq!(notes(1, 3), vec![SAVED_NOTE, FAILED_NOTE], "混着时就回两句");
+        assert!(notes(0, 0).is_empty(), "没图可存时一句都不回");
     }
 
     /// 名单与开关的判定顺序：钩子在任何网络动作之前就要把这两档挡干净
