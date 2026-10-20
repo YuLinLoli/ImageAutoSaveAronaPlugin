@@ -6,3 +6,10 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# ── Linux 目标：这里**故意一个条目都没有** ──────────────────────────────
+# crt-static 是 MSVC 的 C 运行库选项，Linux 上不需要它；更要紧的是 Linux 一旦静态化
+# （musl）dlopen 就成了空桩、rustc 也不支持 musl 的 cdylib，插件根本装不进宿主。
+# 所以"要不要静态 C 运行库"由**构建目标**决定，而不是在这里写成全局 rustflags：
+# 同一份文件分别编 Windows 与 Linux，两边各自拿到正确的链接方式，产物也各自能装进
+# 对应平台的宿主（框架装载前要比对 crt-static 这一项，见 PLUGIN_DEVELOPMENT.md §22）。

@@ -1,18 +1,32 @@
-# 插件自动发布：推 v* 标签时构建 Windows 版 dll 并建 Release。与框架仓同名工作流一套路。
+# 插件自动发布：推 v* 标签时构建 **Windows 与 Linux 两版**插件动态库并建 Release。
+# 与框架仓 Arona-rs 的同名工作流一套路（那边也是 Windows + Linux 两条腿）。
 #
+# ── 为什么是两条腿，而不是"编一次、改个扩展名" ────────────────────────────────
+# 框架把插件动态库直接映射进宿主进程，并跨边界交换 `Arc<dyn AronaPlugin>`。装载前它会逐项
+# 比对工具链指纹（crates/arona/build.rs 算出来、export_arona_plugin! 原样上报），其中就含
+# TARGET / profile / crt-static 三项。所以 **Windows 宿主只装 .dll，Linux 宿主只装 .so**，
+# 两边必须各自按自己的目标三元组重新编一遍；拿 .dll 改名叫 .so 是装载当场拒载，不是"大概能用"。
+# 相应地产物形态也由构建平台决定（见矩阵里的 lib_prefix / lib_ext，以及收集产物那一步）：
+#   Windows  cargo 产出        <name>.dll       不需要 crt 之外的系统依赖
+#   Linux    cargo 产出 lib<name>.so            依赖 glibc（动态链接，**刻意不做静态**）
+# Linux 这一腿不做 crt-static 是硬要求：musl 静态二进制里 dlopen 是空桩、rustc 也不支持
+# musl 的 cdylib，静态化了插件根本装不进宿主。仓库根的 .cargo/config.toml 只给 MSVC 目标
+# 打开 crt-static，Linux 目标天然不走那一行——"要不要静态 C 运行库"由构建目标决定，不是全局开关。
+#
+# ── 为什么要把框架仓也签出来 ───────────────────────────────────────────────
 # 插件与框架唯一不同的一处，也是这份文件存在的核心理由：Cargo.toml 里
 # `arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", ... }` 是**路径依赖**，
 # CI 上那个上一级目录本来不存在。两种省事的做法都不成立——
 #   · 换成 crates.io 版本：那是按发布快照编的，与宿主实际用的框架源码不是一个东西；
-#   · 换成 git 标签：标签落后于宿主构建所用的提交时，编出的 dll 布局号对不上，装载当场被拒。
+#   · 换成 git 标签：标签落后于宿主构建所用的提交时，编出的动态库布局号对不上，装载当场被拒。
 # 所以这里把框架仓签出来放在插件的同级，路径依赖原样成立，目录形状和本机开发一模一样
 # （G:\rustprojects 下插件与 Arona-rs 并排）。宿主用哪份框架编的，就把那个 ref 填进
 # 仓库 Settings → Actions → Variables 的 `ARONA_REF`（分支名、标签或提交号都行）；
 # 不设就用 main——它与当前发版宿主同源（`PluginMeta.group_scoped` 与布局 10 都在上面）。
 #
-# 版本号以 Cargo.toml 为准：标签 v0.1.2 必须等于 [package] version，否则直接失败——
+# 版本号以 Cargo.toml 为准：标签 vX.Y.Z 必须等于 [package] version，否则直接失败——
 # 插件上报给框架的版本取自 env!("CARGO_PKG_VERSION")，标签与它不一致就会出现
-# "Release 写着 0.1.2、GUI 里显示 0.1.1" 这种没法核对的事。
+# "Release 写着 0.1.6、GUI 里显示 0.1.5" 这种没法核对的事。
 name: AutoUploadReleaseBuild
 
 on:
@@ -26,7 +40,22 @@ env:
 
 jobs:
   Build:
-    runs-on: windows-latest
+    # 两腿各编各的平台；fail-fast 关掉，一腿失败不影响另一腿把日志跑完（便于一次看全两边）
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win-x64
+            # cdylib 在 Windows 上不加前缀，扩展名 .dll
+            lib_prefix: ''
+            lib_ext: dll
+          - os: ubuntu-latest
+            platform: linux-x64
+            # cargo 给 cdylib 自动加 lib 前缀，扩展名 .so（框架按 library_extension() 认）
+            lib_prefix: 'lib'
+            lib_ext: so
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: plugin
@@ -44,6 +73,22 @@ jobs:
           ref: ${{ vars.ARONA_REF || 'main' }}
           path: Arona-rs
 
+      # Linux 上唯一的外部构建前提：arona 依赖的 rusqlite 开了 `bundled`，会把 sqlite3.c
+      # 现场编出来，需要一个 C 编译器（cc/gcc）。runner 镜像自带，这里只在缺失时补装，
+      # 并显式打一遍版本——将来镜像若瘦身，失败会明确落在这一步，而不是变成 cc-rs 的
+      # "failed to find tool: x86_64-linux-gnu-gcc" 那种离得很远的间接报错。
+      # Windows 那一腿不需要这条：MSVC 工具链由 runner 自带，C 运行库怎么链由 crt-static 决定。
+      - name: Prepare Linux build prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v cc >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential pkg-config
+          fi
+          cc --version | head -1
+
       # 工具链由插件仓自己的 rust-toolchain.toml 唯一决定：ABI 指纹里带着 rustc 的 release 号，
       # CI 用当天的 stable 编，产物就会和正式宿主对不上指纹而被拒载。这里只打印生效的那份。
       - name: Show active toolchain
@@ -55,6 +100,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: plugin
+          # 两腿的目标三元组不同，缓存不能混用
+          key: ${{ matrix.platform }}
 
       - name: Verify tag matches Cargo.toml version
         if: startsWith(github.ref, 'refs/tags/')
@@ -76,8 +123,12 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      # 产物与发布说明一起准备好。发布说明里那三件事（宿主版本 / 工具链 / 投放路径）全部现取
-      # 现算，不从 README 手抄——手抄的那几处正是会跟代码各说各话的地方。
+      # 产物与发布说明一起准备好。发布说明里那几件事（宿主版本 / 工具链 / 平台 / 投放路径）
+      # 全部现取现算，不从 README 手抄——手抄的那几处正是会跟代码各说各话的地方。
+      #
+      # 这一步用 pwsh 而不是按平台分 bash/pwsh 写两份：GitHub 的 ubuntu 镜像自带 PowerShell 7，
+      # 同一份脚本两边都能跑，省掉一整段"平台分支里各写一遍 id 探测与正则"的重复。
+      # 真正随平台变的只有三样——产物前缀、扩展名、crt 那一句——它们由矩阵与 RUNNER_OS 决定。
       - name: Collect artifact and release notes
         shell: pwsh
         run: |
@@ -86,19 +137,24 @@ jobs:
           $cdylib = $pkg.targets | Where-Object { $_.kind -contains 'cdylib' } |
               Select-Object -First 1
           if (-not $cdylib) {
-              Write-Error "crate 里没有 cdylib 目标，编不出能被框架扫描装载的 dll"
+              Write-Error "crate 里没有 cdylib 目标，编不出能被框架扫描装载的动态库"
               exit 1
           }
-          $dll = Join-Path "target/release" "$($cdylib.name).dll"
-          if (-not (Test-Path $dll)) { Write-Error "未找到构建产物 $dll"; exit 1 }
-          $size = (Get-Item $dll).Length
+
+          # 产物路径由构建平台决定：Windows 是 <name>.dll，Linux 是 lib<name>.so
+          $prefix = '${{ matrix.lib_prefix }}'
+          $ext = '${{ matrix.lib_ext }}'
+          $platformTag = '${{ matrix.platform }}'
+          $built = Join-Path "target/release" "$prefix$($cdylib.name).$ext"
+          if (-not (Test-Path $built)) { Write-Error "未找到构建产物 $built"; exit 1 }
+          $size = (Get-Item $built).Length
           if ($size -lt 100KB) {
-              Write-Error "dll 只有 $size 字节，链接明显没成功，不发出去坑用户"
+              Write-Error "动态库只有 $size 字节，链接明显没成功，不发出去坑用户"
               exit 1
           }
 
           # 框架那一侧的三项：crate 版本、符号布局号、插件契约版本。都从签下来的源码里读，
-          # 因为"宿主是用哪份框架编的"决定这份 dll 装不装得进去
+          # 因为"宿主是用哪份框架编的"决定这份动态库装不装得进去
           $fwManifest = "../Arona-rs/crates/arona/Cargo.toml"
           $fwVersion = ([regex]::Match((Get-Content -Raw $fwManifest),
               '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
@@ -106,8 +162,8 @@ jobs:
           $layout = ([regex]::Match($abiText,
               'ABI_LAYOUT:\s*u32\s*=\s*(\d+)')).Groups[1].Value
           $descText = Get-Content -Raw "../Arona-rs/crates/arona/src/plugin/description.rs"
-          $contract = ([regex]::Match($descText,
-              'FRAMEWORK_API_VERSION[^=]*=\s*ApiVersion::new\((\d+),\s*(\d+),\s*(\d+)\)'))
+          $contract = [regex]::Match($descText,
+              'FRAMEWORK_API_VERSION[^=]*=\s*ApiVersion::new\((\d+),\s*(\d+),\s*(\d+)\)')
           $contractText = "{0}.{1}.{2}" -f $contract.Groups[1].Value, $contract.Groups[2].Value,
               $contract.Groups[3].Value
 
@@ -142,15 +198,31 @@ jobs:
           # 赋值会当场报 VariableNotWritable，写出来的三元组变成 InternalHost
           $hostTriple = ([regex]::Match($vv, '(?m)^host:\s*(.+)$')).Groups[1].Value.Trim()
 
-          $asset = "$($cdylib.name)-$($pkg.version).dll"
-          Copy-Item $dll $asset -Force
+          # CRT 口径也由构建平台决定：MSVC 上静态链接运行库（目标机无需装 VC++ 运行时），
+          # Linux 上走系统 glibc 动态链接（静态化会毁掉 dlopen，插件反而装不进去）
+          $onWindows = $env:RUNNER_OS -eq 'Windows'
+          if ($onWindows) {
+              $heading = "### Windows（$platformTag）"
+              $crtNote = '--release，crt-static（静态链接 MSVC 运行库）'
+              $dropHint = '下载后放进 <框架运行目录>/plugins/' + $id + '/，重启框架'
+          } else {
+              $heading = "### Linux（$platformTag）"
+              $crtNote = '--release，glibc 动态链接（不做 crt-static：静态化会让 dlopen 失效）'
+              $dropHint = '下载后放进 <框架运行目录>/plugins/' + $id + '/（框架也认 plugins/ 直属的 .so），重启框架'
+          }
+
+          $asset = "$prefix$($cdylib.name)-$($pkg.version)-$platformTag.$ext"
+          Copy-Item $built $asset -Force
           $notes = @(
+              $heading,
+              '',
               "适用于 Arona-rs $fwVersion（框架契约 $contractText，符号布局 $layout）",
-              "构建工具链：rustc $rustc，$hostTriple，--release，crt-static",
-              "下载后放进 <框架运行目录>/plugins/$id/，重启框架",
-              "",
-              "宿主必须是同一符号布局号才装得进去；对不上时框架会拒载并在日志写明两边各是几。",
-              "产物 $asset，$([math]::Round($size / 1MB, 2)) MB。"
+              "构建工具链：rustc $rustc，$hostTriple，$crtNote",
+              "产物 $asset，$([math]::Round($size / 1MB, 2)) MB。",
+              $dropHint,
+              '',
+              '插件必须与宿主同平台、同工具链、同目标三元组：Windows 宿主要 .dll，Linux 宿主要 .so，两者不能互换。',
+              '宿主还必须是同一符号布局号才装得进去；对不上时框架会拒载并在日志写明两边各是几。'
           )
           # 显式无 BOM 的 UTF-8：Set-Content 的 -Encoding utf8 在 5.1 与 7 上行为不同
           # （前者带 BOM），Release 正文开头多一个不可见字符很难查；WriteAllLines 两版一致，
@@ -176,16 +248,31 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download artifact
+      # 刻意**不开** merge-multiple：两腿的工件里都各有一个 NOTES.md，平铺到一起会互相覆盖，
+      # 最后 Release 正文只会剩下其中一个平台的说法。不合并则落到 dist/<工件名>/ 下，下一步再拼。
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
-          merge-multiple: true
+
+      - name: Merge release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          : > dist/NOTES.md
+          for f in dist/*/NOTES.md; do
+            [ -e "$f" ] || continue
+            cat "$f" >> dist/NOTES.md
+            printf '\n' >> dist/NOTES.md
+          done
+          echo '--- 合并后的发布说明 ---'
+          cat dist/NOTES.md
 
       - name: Publish Release
         uses: ncipollo/release-action@v1
         with:
-          artifacts: "dist/*.dll"
+          # 两腿的产物各有各的前缀与扩展名，一起发上去
+          artifacts: "dist/*/*.dll,dist/*/*.so"
           # 入参名是 bodyFile，写成 bodyPath 不会失败——action 只给一条
           # "Unexpected input(s)" 警告，Release 照建，正文静默为空。第一次跑就踩中了，
           # 改名并留这一句：正文空着比构建失败更难发现
