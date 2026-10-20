@@ -50,11 +50,16 @@ jobs:
             # cdylib 在 Windows 上不加前缀，扩展名 .dll
             lib_prefix: ''
             lib_ext: dll
+            # 不带 --target，产物就落在 target/release
+            release_dir: target/release
           - os: ubuntu-latest
             platform: linux-x64
             # cargo 给 cdylib 自动加 lib 前缀，扩展名 .so（框架按 library_extension() 认）
             lib_prefix: 'lib'
             lib_ext: so
+            # 这一腿显式带 --target（为的是钉 glibc 基线），所以产物落在三元组子目录下。
+            # 注意目录名**没有** .2.17 后缀：那个后缀只传给链接器，cargo 认的还是基础三元组。
+            release_dir: target/x86_64-unknown-linux-gnu/release
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -108,6 +113,31 @@ jobs:
           ls -l /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
                 /usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc
 
+      # Linux 交付件要按 **glibc 2.17 基线**链接：插件是 .so，宿主的 glibc 低于链接基线
+      # 会直接拒绝装载。2.17 是 CentOS 7 / Ubuntu 16.04 时代的水位，钉在这儿意味着之后
+      # 所有发行版（含框架的 compat 包宿主）都能装同一份 .so，不必给用户两个包去挑。
+      #
+      # 这条路对 ABI 是**无痛**的：`.2.17` 只是 cargo-zigbuild 的语法，只影响链接阶段，
+      # cargo 认的目标仍是 x86_64-unknown-linux-gnu —— 于是 build.rs 读到的 TARGET、
+      # 以及算出来的 ABI 指纹（target 段 + crt-static 段）跟普通 gnu 构建一字不差，
+      # 装载握手不受任何影响。反证也说明了这一点：框架自己的 compat 包宿主必须能装
+      # 普通方式编出来的插件，指纹不可能随 glibc 基线变。
+      #
+      # zig 版本与框架仓 Windows/Linux 两条腿保持一致（0.17.0），两边用同一套链接器行为。
+      - name: Install zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-zigbuild --locked
+          cargo zigbuild --version
+
       # 工具链由插件仓自己的 rust-toolchain.toml 唯一决定：ABI 指纹里带着 rustc 的 release 号，
       # CI 用当天的 stable 编，产物就会和正式宿主对不上指纹而被拒载。这里只打印生效的那份。
       - name: Show active toolchain
@@ -135,12 +165,22 @@ jobs:
           }
           Write-Host "版本校验通过: $($pkg.name) $($pkg.version)"
 
-      # 离线单测。各仓联网冒烟用例都带 #[ignore]，不会在这里跑
+      # 离线单测。各仓联网冒烟用例都带 #[ignore]，不会在这里跑。
+      # 这里刻意不带 --target：用例跑在构建机自己的目标上最快，也没有"给老系统也能跑"
+      # 的诉求——基线只对交付的 .so 有意义。
       - name: Test
         run: cargo test --release
 
-      - name: Build
+      # Windows：普通 release 构建
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
         run: cargo build --release
+
+      # Linux：走 cargo zigbuild 把 glibc 钉在 2.17（理由见上面 Install zig 那一段）
+      - name: Build (Linux, glibc 2.17)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
 
       # 产物与发布说明一起准备好。发布说明里那几件事（宿主版本 / 工具链 / 平台 / 投放路径）
       # 全部现取现算，不从 README 手抄——手抄的那几处正是会跟代码各说各话的地方。
@@ -160,16 +200,44 @@ jobs:
               exit 1
           }
 
-          # 产物路径由构建平台决定：Windows 是 <name>.dll，Linux 是 lib<name>.so
+          # 产物路径由构建平台决定：Windows 是 target/release/<name>.dll，
+          # Linux 是 target/x86_64-unknown-linux-gnu/release/lib<name>.so
+          # （显式带 --target 时 cargo 会把产物放进三元组子目录，目录名不带 .2.17 后缀）
           $prefix = '${{ matrix.lib_prefix }}'
           $ext = '${{ matrix.lib_ext }}'
           $platformTag = '${{ matrix.platform }}'
-          $built = Join-Path "target/release" "$prefix$($cdylib.name).$ext"
+          $built = Join-Path '${{ matrix.release_dir }}' "$prefix$($cdylib.name).$ext"
           if (-not (Test-Path $built)) { Write-Error "未找到构建产物 $built"; exit 1 }
           $size = (Get-Item $built).Length
           if ($size -lt 100KB) {
               Write-Error "动态库只有 $size 字节，链接明显没成功，不发出去坑用户"
               exit 1
+          }
+
+          # Linux 那份必须真的钉在 glibc 2.17 上——这是它能装进老系统的唯一依据，
+          # 而"zigbuild 到底生效没有"光看命令有没有报错是看不出来的（比如 target 后缀
+          # 被悄悄忽略，照样编得出一份要 2.34 的 .so）。这里按符号版本实扫一遍：
+          # 有任何一个符号要求高于 2.17，就直接不发，免得把"声称万能"的东西发出去。
+          if ($env:RUNNER_OS -ne 'Windows') {
+              $objdump = Get-Command objdump -ErrorAction SilentlyContinue
+              if (-not $objdump) {
+                  Write-Error "找不到 objdump，没法核对 glibc 基线（binutils 本应随 runner 自带）"
+                  exit 1
+              }
+              $vers = & $objdump.Source -T $built |
+                  Select-String -Pattern 'GLIBC_(\d+)\.(\d+)' -AllMatches |
+                  ForEach-Object { $_.Matches } |
+                  ForEach-Object { [version]("{0}.{1}" -f $_.Groups[1].Value, $_.Groups[2].Value) }
+              if (-not $vers) {
+                  Write-Error "objdump 没扫到任何 GLIBC 符号版本，产物形态可疑：$built"
+                  exit 1
+              }
+              $maxVer = $vers | Sort-Object -Descending | Select-Object -First 1
+              Write-Host "最高 GLIBC 符号版本: $maxVer"
+              if ($maxVer -gt [version]'2.17') {
+                  Write-Error "glibc 基线没钉住：最高要求 $maxVer > 2.17，zigbuild 的 target 后缀没生效"
+                  exit 1
+              }
           }
 
           # 框架那一侧的三项：crate 版本、符号布局号、插件契约版本。都从签下来的源码里读，
@@ -217,17 +285,23 @@ jobs:
           # 赋值会当场报 VariableNotWritable，写出来的三元组变成 InternalHost
           $hostTriple = ([regex]::Match($vv, '(?m)^host:\s*(.+)$')).Groups[1].Value.Trim()
 
-          # CRT 口径也由构建平台决定：MSVC 上静态链接运行库（目标机无需装 VC++ 运行时），
-          # Linux 上走系统 glibc 动态链接（静态化会毁掉 dlopen，插件反而装不进去）
+          # CRT / glibc 口径也由构建平台决定：MSVC 上静态链接运行库（目标机无需装 VC++ 运行时）；
+          # Linux 上不可能静态（musl 静态会让 dlopen 失效），改为用 zigbuild 把 glibc 基线
+          # 钉在 2.17，这样同一份 .so 在标准包宿主与 compat 包宿主上都能装。
           $onWindows = $env:RUNNER_OS -eq 'Windows'
+          $extra = @()
           if ($onWindows) {
               $heading = "### Windows（$platformTag）"
-              $crtNote = '--release，crt-static（静态链接 MSVC 运行库）'
+              $crtNote = '--release，crt-static（静态链接 MSVC 运行库，目标机无需装 VC++ 运行时）'
               $dropHint = '下载后放进 <框架运行目录>/plugins/' + $id + '/，重启框架'
           } else {
               $heading = "### Linux（$platformTag）"
-              $crtNote = '--release，glibc 动态链接（不做 crt-static：静态化会让 dlopen 失效）'
+              $crtNote = "--release，cargo-zigbuild 按 glibc 2.17 基线链接（实扫最高 GLIBC 符号 $maxVer）"
               $dropHint = '下载后放进 <框架运行目录>/plugins/' + $id + '/（框架也认 plugins/ 直属的 .so），重启框架'
+              $extra = @(
+                  'glibc 基线 2.17：框架的标准包宿主与 compat 包宿主装的是同一份 .so，不必二选一；',
+                  'CentOS 7 / Ubuntu 16.04 时代起的发行版都能装载。'
+              )
           }
 
           $asset = "$prefix$($cdylib.name)-$($pkg.version)-$platformTag.$ext"
@@ -238,7 +312,8 @@ jobs:
               "适用于 Arona-rs $fwVersion（框架契约 $contractText，符号布局 $layout）",
               "构建工具链：rustc $rustc，$hostTriple，$crtNote",
               "产物 $asset，$([math]::Round($size / 1MB, 2)) MB。",
-              $dropHint,
+              $dropHint
+          ) + $extra + @(
               '',
               '插件必须与宿主同平台、同工具链、同目标三元组：Windows 宿主要 .dll，Linux 宿主要 .so，两者不能互换。',
               '宿主还必须是同一符号布局号才装得进去；对不上时框架会拒载并在日志写明两边各是几。'
