@@ -108,13 +108,21 @@ mirai 那份比的是 HTTP 响应头的 `Content-Type`；这边字节已经到�
 ## 发布三件事（框架文档 §22 要求写明）
 
 ```
-适用于 Arona-rs 1.1.0（框架契约 1.0.0，符号布局 10）
-构建工具链：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
+适用于 Arona-rs 1.2.0（框架契约 1.0.0，符号布局 10）
+Windows：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
+Linux：  rustc 1.98.0，x86_64-unknown-linux-gnu，--release，cargo-zigbuild 按 glibc 2.17 基线链接
 下载后放进 <框架运行目录>/plugins/image-auto-save/，重启框架
 ```
 
+产物名 Windows 是 `image_auto_save_plugin.dll`、Linux 是 `libimage_auto_save_plugin.so`，
+两者不能互换：插件被 `dlopen` 进宿主进程，装载前要比对工具链指纹，目标三元组就是其中一项。
+Linux 那份按 glibc 2.17 链接，框架的标准包与 compat 包宿主装的是同一个 `.so`；这个后缀只影响
+链接阶段，指纹里的 `target` 仍是 `x86_64-unknown-linux-gnu`，与普通 gnu 构建一致。
+
 版本号以 `rust-toolchain.toml` 那一行为准；`.cargo/config.toml` 那两行 CRT 设置必须与框架仓库
-逐字一致。对不上不是"握手失败"这么客气，而是随机崩溃，所以框架会直接拒载。
+逐字一致——它**只对 MSVC 目标生效**，Linux 目标故意没有条目：musl 静态下 `dlopen` 是空桩，
+静态化了插件反而装不进去，所以 Linux 走 glibc 动态链接。对不上不是"握手失败"这么客气，
+而是随机崩溃，所以框架会直接拒载。
 
 ## 开发
 
