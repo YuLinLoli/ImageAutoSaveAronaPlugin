@@ -50,16 +50,11 @@ jobs:
             # cdylib 在 Windows 上不加前缀，扩展名 .dll
             lib_prefix: ''
             lib_ext: dll
-            # 不带 --target，产物就落在 target/release
-            release_dir: target/release
           - os: ubuntu-latest
             platform: linux-x64
             # cargo 给 cdylib 自动加 lib 前缀，扩展名 .so（框架按 library_extension() 认）
             lib_prefix: 'lib'
             lib_ext: so
-            # 这一腿显式带 --target（为的是钉 glibc 基线），所以产物落在三元组子目录下。
-            # 注意目录名**没有** .2.17 后缀：那个后缀只传给链接器，cargo 认的还是基础三元组。
-            release_dir: target/x86_64-unknown-linux-gnu/release
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -136,7 +131,10 @@ jobs:
         run: |
           set -euo pipefail
           cargo install cargo-zigbuild --locked
-          cargo zigbuild --version
+          # 只打版本做记录。别写 `cargo zigbuild --version`——cargo-zigbuild 的 CLI
+          # 只认 `zigbuild --verbose`，多一个不认识的参数就 exit 2（第一次跑就踩了）
+          zig version
+          command -v cargo-zigbuild
 
       # 工具链由插件仓自己的 rust-toolchain.toml 唯一决定：ABI 指纹里带着 rustc 的 release 号，
       # CI 用当天的 stable 编，产物就会和正式宿主对不上指纹而被拒载。这里只打印生效的那份。
@@ -202,11 +200,15 @@ jobs:
 
           # 产物路径由构建平台决定：Windows 是 target/release/<name>.dll，
           # Linux 是 target/x86_64-unknown-linux-gnu/release/lib<name>.so
-          # （显式带 --target 时 cargo 会把产物放进三元组子目录，目录名不带 .2.17 后缀）
+          # （Linux 腿显式带 --target，cargo 就会把产物放进三元组子目录；
+          #  目录名**不带** .2.17 后缀——那个后缀只传给链接器，cargo 认的还是基础三元组）
+          $onWindows = $env:RUNNER_OS -eq 'Windows'
           $prefix = '${{ matrix.lib_prefix }}'
           $ext = '${{ matrix.lib_ext }}'
           $platformTag = '${{ matrix.platform }}'
-          $built = Join-Path '${{ matrix.release_dir }}' "$prefix$($cdylib.name).$ext"
+          $releaseDir = 'target/release'
+          if (-not $onWindows) { $releaseDir = 'target/x86_64-unknown-linux-gnu/release' }
+          $built = Join-Path $releaseDir "$prefix$($cdylib.name).$ext"
           if (-not (Test-Path $built)) { Write-Error "未找到构建产物 $built"; exit 1 }
           $size = (Get-Item $built).Length
           if ($size -lt 100KB) {
@@ -288,7 +290,7 @@ jobs:
           # CRT / glibc 口径也由构建平台决定：MSVC 上静态链接运行库（目标机无需装 VC++ 运行时）；
           # Linux 上不可能静态（musl 静态会让 dlopen 失效），改为用 zigbuild 把 glibc 基线
           # 钉在 2.17，这样同一份 .so 在标准包宿主与 compat 包宿主上都能装。
-          $onWindows = $env:RUNNER_OS -eq 'Windows'
+          # （$onWindows 在上面取产物路径时已经算过了，这里直接复用）
           $extra = @()
           if ($onWindows) {
               $heading = "### Windows（$platformTag）"
