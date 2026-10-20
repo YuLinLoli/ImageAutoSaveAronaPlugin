@@ -73,21 +73,40 @@ jobs:
           ref: ${{ vars.ARONA_REF || 'main' }}
           path: Arona-rs
 
-      # Linux 上唯一的外部构建前提：arona 依赖的 rusqlite 开了 `bundled`，会把 sqlite3.c
-      # 现场编出来，需要一个 C 编译器（cc/gcc）。runner 镜像自带，这里只在缺失时补装，
-      # 并显式打一遍版本——将来镜像若瘦身，失败会明确落在这一步，而不是变成 cc-rs 的
-      # "failed to find tool: x86_64-linux-gnu-gcc" 那种离得很远的间接报错。
-      # Windows 那一腿不需要这条：MSVC 工具链由 runner 自带，C 运行库怎么链由 crt-static 决定。
+      # Linux 腿有两项外部前提，都由 runner 现装；Windows 腿两项都不需要
+      # （MSVC 工具链自带，系统里本来就有 SimHei/微软雅黑）。
+      #
+      # ① C 编译器：arona 依赖的 rusqlite 开了 `bundled`，会把 sqlite3.c 现场编出来。
+      # ② 中文字体：出图插件的用例要真画汉字，而**裸 runner 一份 CJK 字都没有**——
+      #    缺了会以「找不到中文字体：安装目录的 fonts/ 里没有字体文件」当场 panic
+      #    （bilibili 33 条、petpet 2 条）。装 fonts-noto-cjk 后正好命中框架
+      #    arona::runtime::text::CANDIDATES 的第一条系统候选
+      #    /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc；同一个包里还带
+      #    NotoSansCJK-Bold.ttc，粗体那一档用例才有真粗体面可走（否则只能走叠画兜底）。
+      #
+      # 两项都在缺失时才装：镜像一旦自带就跳过 apt，省掉一次 update 的等待与抖动。
       - name: Prepare Linux build prerequisites
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v cc >/dev/null 2>&1; then
+          need=0
+          command -v cc >/dev/null 2>&1 || need=1
+          [ -f /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc ] || need=1
+          if [ "$need" -eq 1 ]; then
             sudo apt-get update
-            sudo apt-get install -y build-essential pkg-config
+            sudo apt-get install -y build-essential pkg-config fonts-noto-cjk
           fi
           cc --version | head -1
+          # 字体这一条要真的点名核对：装没装上直接决定那批出图用例是过还是 panic，
+          # 与其在 Test 步里看 33 条一样的 panic，不如在这里一次说清
+          if [ ! -f /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc ]; then
+            echo "::error::中文字体没到位，出图用例会以「找不到中文字体」失败"
+            find /usr/share/fonts -name 'NotoSansCJK*' -o -name '*wqy*' | head -20
+            exit 1
+          fi
+          ls -l /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
+                /usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc
 
       # 工具链由插件仓自己的 rust-toolchain.toml 唯一决定：ABI 指纹里带着 rustc 的 release 号，
       # CI 用当天的 stable 编，产物就会和正式宿主对不上指纹而被拒载。这里只打印生效的那份。
