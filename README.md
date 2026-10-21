@@ -108,7 +108,7 @@ mirai 那份比的是 HTTP 响应头的 `Content-Type`；这边字节已经到�
 ## 发布三件事（框架文档 §22 要求写明）
 
 ```
-适用于 Arona-rs 1.2.0（框架契约 1.0.0，符号布局 10）
+适用于 Arona-rs 1.2.1（符号布局 10）
 Windows：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 Linux：  rustc 1.98.0，x86_64-unknown-linux-gnu，--release，cargo-zigbuild 按 glibc 2.17 基线链接
 下载后放进 <框架运行目录>/plugins/image-auto-save/，重启框架
@@ -123,6 +123,9 @@ Linux 那份按 glibc 2.17 链接，框架的标准包与 compat 包宿主装的
 逐字一致——它**只对 MSVC 目标生效**，Linux 目标故意没有条目：musl 静态下 `dlopen` 是空桩，
 静态化了插件反而装不进去，所以 Linux 走 glibc 动态链接。对不上不是"握手失败"这么客气，
 而是随机崩溃，所以框架会直接拒载。
+
+框架 1.2.1 起只比布局号 + 工具链指纹，契约版本与 crate 版本都已从判据里删掉；但 1.2.0 及更早
+编的插件在 1.2.1 宿主上会被拒载——指纹串去掉了 `arona/<版本>` 前缀，而比对是全等，重编即可。
 
 ## 开发
 
