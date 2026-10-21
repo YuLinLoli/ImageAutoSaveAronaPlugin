@@ -242,19 +242,17 @@ jobs:
               }
           }
 
-          # 框架那一侧的三项：crate 版本、符号布局号、插件契约版本。都从签下来的源码里读，
-          # 因为"宿主是用哪份框架编的"决定这份动态库装不装得进去
+          # 框架那一侧的两项：crate 版本与符号布局号，都从签下来的源码里读，
+          # 因为"宿主是用哪份框架编的"决定这份动态库装不装得进去。
+          # 框架 1.2.1 起握手只比布局号 + 工具链指纹：契约版本（FRAMEWORK_API_VERSION）
+          # 与 crate 版本都已从判据里删掉，所以这里也不再读它们——去读一个已经不存在的
+          # 常量，只会让发布说明里那个括号写出一句空话。
           $fwManifest = "../Arona-rs/crates/arona/Cargo.toml"
           $fwVersion = ([regex]::Match((Get-Content -Raw $fwManifest),
               '(?m)^version\s*=\s*"([^"]+)"')).Groups[1].Value
           $abiText = Get-Content -Raw "../Arona-rs/crates/arona/src/plugin/abi.rs"
           $layout = ([regex]::Match($abiText,
               'ABI_LAYOUT:\s*u32\s*=\s*(\d+)')).Groups[1].Value
-          $descText = Get-Content -Raw "../Arona-rs/crates/arona/src/plugin/description.rs"
-          $contract = [regex]::Match($descText,
-              'FRAMEWORK_API_VERSION[^=]*=\s*ApiVersion::new\((\d+),\s*(\d+),\s*(\d+)\)')
-          $contractText = "{0}.{1}.{2}" -f $contract.Groups[1].Value, $contract.Groups[2].Value,
-              $contract.Groups[3].Value
 
           # 插件 id：先扫 cdylib 的入口文件，再扫其余源文件（petpet 那种 lib.rs 只做 mod 转发、
           # meta() 写在业务模块里的仓库要往后找）。两条判据都要求"像个 id"——小写字母开头、
@@ -311,7 +309,7 @@ jobs:
           $notes = @(
               $heading,
               '',
-              "适用于 Arona-rs $fwVersion（框架契约 $contractText，符号布局 $layout）",
+              "适用于 Arona-rs $fwVersion（符号布局 $layout）",
               "构建工具链：rustc $rustc，$hostTriple，$crtNote",
               "产物 $asset，$([math]::Round($size / 1MB, 2)) MB。",
               $dropHint
