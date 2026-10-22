@@ -108,7 +108,7 @@ mirai 那份比的是 HTTP 响应头的 `Content-Type`；这边字节已经到�
 ## 发布三件事（框架文档 §22 要求写明）
 
 ```
-适用于 Arona-rs 1.2.1（符号布局 10）
+适用于 Arona-rs 1.2.2（符号布局 10）
 Windows：rustc 1.98.0，x86_64-pc-windows-msvc，--release，crt-static
 Linux：  rustc 1.98.0，x86_64-unknown-linux-gnu，--release，cargo-zigbuild 按 glibc 2.17 基线链接
 下载后放进 <框架运行目录>/plugins/image-auto-save/，重启框架

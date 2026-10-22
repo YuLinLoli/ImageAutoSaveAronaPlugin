@@ -2,7 +2,7 @@
 # 插件发布名。真正的插件 id 是 src/lib.rs 里 PluginMeta::new 的第一个参数
 # （"image-auto-save"），它决定 plugins/<id>/、config/<id>/arona.yml 与 data/<id>/ 的目录名。
 name = "image-auto-save-arona-plugin"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "好友图片自动保存：按白名单收下好友私聊发来的图片落盘，并把图片连发送人一起预览给指定目标"
